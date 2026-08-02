@@ -35,8 +35,6 @@ class DHTStore:
             value = payload.get("value")
             ttl = payload.get("ttl", 86400)
             # Не реплицируем свои же сообщения
-            if msg.get("from") == self.node_id:
-                return None
             return self._store(key, value, ttl, msg.get("from"))
         elif op == "get":
             key = payload.get("key")
