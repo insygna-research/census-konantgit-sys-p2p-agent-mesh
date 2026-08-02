@@ -193,10 +193,12 @@ class AgentMesh:
             or value.get("agent_id", "") + "-agent"  # "cryter" → "cryter-agent"
             or msg.get("from")
         )
-        trusted = ["cryter-agent", "forecaster-agent", "archivist-agent", "mesh-connector", "relay-mesh-bridge"]
+        trusted = ["cryter-agent", "forecaster-agent", "archivist-agent", "mesh-connector", "relay-mesh-bridge", "dashboard", "v2bot", "observer", "echo"]
         # Проверка по содержимому в peer_id
         sender_short = sender.replace("did:p2p:", "") if sender else "?"
-        if sender_short in trusted or sender in trusted:
+        # Also trust any agent that matches known agent names with or without -agent suffix
+        sender_base = sender_short.replace("-agent", "")
+        if sender_short in trusted or sender in trusted or sender_base in trusted:
             self.dht.handle_message(msg)
             now = time.time()
             if now - self._last_dht_repub > 1.0:
