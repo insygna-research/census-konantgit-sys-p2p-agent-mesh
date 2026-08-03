@@ -28,13 +28,14 @@ class RaftNode:
         self._peers: list[str] = []  # peer node_ids
 
     def _rand_timeout(self) -> float:
-        return random.uniform(0.15, 0.30)
+        return random.uniform(0.50, 1.50)  # wide range to avoid split votes
 
     async def start(self, peers: list[str] = None):
         """Запустить Raft-ноду."""
         self._running = True
         if peers:
             self._peers = peers
+        self._last_heartbeat = time.time()  # reset on leader heartbeats
         print(f"[raft:{self.node_id}] Started as {self.state}, term={self.current_term}, peers={len(self._peers)}")
 
         if self.transport:
@@ -52,8 +53,13 @@ class RaftNode:
 
     # ── RPC Messages ──────────────────────────
 
-    def _on_raft_msg(self, msg: dict):
+    def _on_raft_msg(self, raw: bytes):
         """Callback из transport — обрабатывает входящие Raft-сообщения."""
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+
         try:
             payload = msg.get("payload", {})
             rpc_type = payload.get("type", "")
@@ -80,7 +86,7 @@ class RaftNode:
             "payload": payload,
         }
         try:
-            await self.transport.emit("_raft", msg)
+            await self.transport.publish("_raft", json.dumps(msg).encode())
         except Exception as e:
             print(f"[raft:{self.node_id}] Send error: {e}")
 
@@ -95,7 +101,12 @@ class RaftNode:
             if not self._running:
                 break
             if self.state == "leader":
-                continue  # уже лидер, heartbeat loop работает
+                continue
+
+            # Don't start election if we recently got a heartbeat
+            # Add random jitter to avoid all nodes starting elections simultaneously
+            if time.time() - self._last_heartbeat < 0.3 + random.uniform(0, 0.7):
+                continue
 
             await self._start_election()
 
@@ -106,8 +117,16 @@ class RaftNode:
         self.voted_for = self.node_id
         self.leader_id = None
 
-        votes = 1  # голос за себя
-        votes_needed = (len(self._peers) // 2) + 1
+        self._votes_received = 1  # голос за себя
+        self._votes_needed = (len(self._peers) // 2) + 1 if self._peers else 1
+        self._election_term = self.current_term  # зафиксировать терм для подсчёта голосов
+
+        print(f"[raft:{self.node_id}] Election started: term={self.current_term}, need={self._votes_needed} votes")
+
+        # Check if single-node cluster → immediate leadership
+        if self._votes_received >= self._votes_needed:
+            self._become_leader()
+            return
 
         # Отправляем RequestVote всем пирам
         for peer_id in self._peers:
@@ -120,11 +139,10 @@ class RaftNode:
                 "last_log_index": len(self.wal.entries) if self.wal else 0,
                 "last_log_term": self.current_term,
             }
-            # Отправляем через emit — обработчик пира ответит
-            asyncio.create_task(self._send_raft_vote_request(peer_id, payload, votes, votes_needed))
+            asyncio.create_task(self._send_raft_vote_request(peer_id, payload))
 
-    async def _send_raft_vote_request(self, peer_id, payload, votes, votes_needed):
-        """Отправить запрос голоса и ждать ответа."""
+    async def _send_raft_vote_request(self, peer_id, payload):
+        """Отправить запрос голоса."""
         try:
             msg = {
                 "from": self.node_id,
@@ -132,7 +150,7 @@ class RaftNode:
                 "type": "raft",
                 "payload": payload,
             }
-            await self.transport.emit("_raft", msg)
+            await self.transport.publish("_raft", json.dumps(msg).encode())
         except Exception:
             pass
 
@@ -140,6 +158,10 @@ class RaftNode:
         """Обработать входящий RequestVote."""
         term = payload.get("term", 0)
         candidate_id = payload.get("candidate_id", "")
+
+        # Ignore self
+        if candidate_id == self.node_id:
+            return
 
         if term > self.current_term:
             self.current_term = term
@@ -164,15 +186,35 @@ class RaftNode:
             # Проверяем — не стали ли мы лидером после получения достаточного числа голосов
             pass  # MVP: counting votes is done optimistically in _start_election
 
+    def _become_leader(self):
+        """Стать лидером."""
+        self.state = "leader"
+        self.leader_id = self.node_id
+        print(f"[raft:{self.node_id}] 👑 Elected LEADER (term {self.current_term})")
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
     def _handle_request_vote_response(self, payload: dict):
         """Обработать ответ на запрос голоса."""
-        # MVP: упрощённо — если один peer ответил grant, считаем что выборы прошли
+        if self.state != "candidate":
+            return  # уже не кандидат (стал лидером или follower'ом)
+
+        term = payload.get("term", 0)
+        if term > self.current_term:
+            self.current_term = term
+            self.state = "follower"
+            self.voted_for = None
+            return
+
+        if term < self.current_term:
+            return  # старый ответ, игнорируем
+
         if payload.get("vote_granted"):
-            self.state = "leader"
-            self.leader_id = self.node_id
-            print(f"[raft:{self.node_id}] 👑 Elected LEADER (term {self.current_term})")
-            if self._heartbeat_task is None or self._heartbeat_task.done():
-                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._votes_received += 1
+            print(f"[raft:{self.node_id}] Vote received: {self._votes_received}/{self._votes_needed}")
+
+            if self._votes_received >= self._votes_needed:
+                self._become_leader()
 
     # ── Heartbeat / AppendEntries ─────────────
 
@@ -196,12 +238,15 @@ class RaftNode:
         term = payload.get("term", 0)
         leader_id = payload.get("leader_id", "")
 
+        # Ignore self-heartbeats
+        if leader_id == self.node_id:
+            return
+
         if term >= self.current_term:
             self.current_term = term
             self.state = "follower"
             self.leader_id = leader_id
-
-            # Reset election timer (done implicitly by the election loop checking state)
+            self._last_heartbeat = time.time()  # reset election timer
 
             # Append any entries
             entries = payload.get("entries", [])
@@ -229,42 +274,67 @@ class RaftNode:
 
 async def _test_3node_election():
     """Тест: 3 Raft-ноды, симуляция election."""
-    class FakeTransport:
-        async def emit(self, topic, msg):
-            pass
-        async def subscribe(self, topic, cb):
-            pass
+    # Shared message bus
+    nodes_data = []  # list of (node, transport, wal)
+
+    class SharedBus:
+        def __init__(self):
+            self.subscribers = {}  # node_id -> callback
+        def add(self, node_id, cb):
+            self.subscribers[node_id] = cb
+        async def publish(self, topic, data):
+            msg = json.loads(data)
+            for nid, cb in list(self.subscribers.items()):
+                try:
+                    cb(data)
+                except Exception:
+                    pass
+
+    bus = SharedBus()
 
     class FakeWAL:
         entries = []
         def append(self, e):
             self.entries.append(e)
 
+    class FakeTransport:
+        def __init__(self, node_id):
+            self.node_id = node_id
+        async def subscribe(self, topic, cb):
+            bus.add(self.node_id, cb)
+        async def publish(self, topic, data):
+            await bus.publish(topic, data)
+
     nodes = []
     for i in range(3):
         nid = f"node-{i}"
-        node = RaftNode(nid, transport=FakeTransport(), wal=FakeWAL())
+        transport = FakeTransport(nid)
+        node = RaftNode(nid, transport=transport, wal=FakeWAL())
         nodes.append(node)
 
-    # Start all nodes
+    # Start with full peer list
     peers = [n.node_id for n in nodes]
     for n in nodes:
         await n.start(peers=peers)
 
-    # Simulate: one node gets vote response → becomes leader
-    nodes[0]._handle_request_vote_response({"vote_granted": True, "candidate_id": "node-0"})
+    # Wait for election (random timeout 150-300ms)
+    await asyncio.sleep(1.5)
 
-    # Wait briefly for leader to settle
-    await asyncio.sleep(0.1)
+    states = [n.state for n in nodes]
+    leader_count = sum(1 for s in states if s == "leader")
+    follower_count = sum(1 for s in states if s == "follower")
 
-    leader_count = sum(1 for n in nodes if n.state == "leader")
-    assert leader_count == 1, f"Expected 1 leader, got {leader_count}"
-    assert nodes[0].state == "leader", f"node-0 should be leader, is {nodes[0].state}"
+    assert leader_count == 1, f"Expected 1 leader, got {leader_count}. States: {states}"
+    assert follower_count == 2, f"Expected 2 followers, got {follower_count}. States: {states}"
+
+    leader_node = next(n for n in nodes if n.state == "leader")
+    print(f"  Leader: {leader_node.node_id}, term={leader_node.current_term}")
+    print(f"  Followers: {[n.node_id for n in nodes if n.state == 'follower']}")
 
     for n in nodes:
         await n.stop()
 
-    print("✅ test_3node_election PASSED")
+    print(f"✅ test_3node_election PASSED")
     return True
 
 
@@ -273,10 +343,14 @@ async def _test_leader_heartbeat():
     calls = []
 
     class FakeTransport:
+        def __init__(self):
+            self.msgs = []
         async def emit(self, topic, msg):
-            calls.append(msg)
+            pass
         async def subscribe(self, topic, cb):
             self.cb = cb
+        async def publish(self, topic, data):
+            self.msgs.append(json.loads(data))
 
     class FakeWAL:
         entries = []
@@ -296,7 +370,7 @@ async def _test_leader_heartbeat():
     node._running = False
     node._heartbeat_task.cancel()
 
-    heartbeats = [m for m in calls if m["payload"].get("type") == "append_entries"]
+    heartbeats = [m for m in transport.msgs if m["payload"].get("type") == "append_entries"]
     assert len(heartbeats) >= 1, f"Expected ≥1 heartbeat, got {len(heartbeats)}"
 
     await node.stop()
@@ -309,7 +383,7 @@ async def _test_election_timeout():
     node = RaftNode("test-node")
     for _ in range(20):
         t = node._rand_timeout()
-        assert 0.15 <= t <= 0.30, f"Timeout {t} out of range [0.15, 0.30]"
+        assert 0.50 <= t <= 1.50, f"Timeout {t} out of range [0.50, 1.50]"
     print("✅ test_election_timeout PASSED")
     return True
 
