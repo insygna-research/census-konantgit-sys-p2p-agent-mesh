@@ -73,7 +73,7 @@ class P2PTransport:
         # TLS sessions (peer_pubkey_prefix -> SecureSession)
         self._tls_sessions: dict[str, SecureSession] = {}
 
-    async def start(self, host: str = "127.0.0.1", port: int = 0):
+    async def start(self, host: str = "0.0.0.0", port: int = 0):
         """Запустить транспорт + TCP сервер на host:port (0 = случайный)."""
         self._running = True
         self.peer_id = f"did:p2p:{self.node_id}"
@@ -324,6 +324,12 @@ class P2PTransport:
     def _start_reconnect_loop(self, peer_id: str, host: str, port: int):
         task = asyncio.create_task(self._reconnect_loop(peer_id, host, port))
         self._reconnect_tasks[peer_id] = task
+
+    async def connect_peer(self, peer_id: str, host: str, port: int):
+        """Public API: initiate connection to a remote peer (v0.6.0 NAT Traversal)."""
+        if peer_id in self._reconnect_tasks:
+            return  # already connecting
+        self._start_reconnect_loop(peer_id, host, port)
 
     async def _reconnect_loop(self, peer_id: str, host: str, port: int):
         """Цикл переподключения с exponential backoff + TLS handshake."""
