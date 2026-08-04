@@ -1,0 +1,136 @@
+name: 55-Peer Scale Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      peer_count:
+        description: "Number of peers to spawn"
+        required: true
+        default: "55"
+      msg_count:
+        description: "Messages per peer"
+        required: true
+        default: "10"
+      relay_host:
+        description: "Relay hostname"
+        required: true
+        default: "mesh-test.v2.site"
+      relay_port:
+        description: "Relay port"
+        required: true
+        default: "9766"
+
+jobs:
+  peers:
+    name: "Peer ${{ matrix.peer_index }}"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        peer_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CI Peer
+        id: peer
+        timeout-minutes: 3
+        env:
+          MESH_RELAY_HOST: ${{ github.event.inputs.relay_host || 'mesh-test.v2.site' }}
+          MESH_RELAY_PORT: ${{ github.event.inputs.relay_port || '9766' }}
+          MSG_COUNT: ${{ github.event.inputs.msg_count || '10' }}
+          TIMEOUT: "120"
+          PEER_ID: "ci-peer-${{ github.run_id }}-${{ matrix.peer_index }}"
+        run: python3 .github/ci_peer.py 2>&1 | tee /tmp/peer-output.txt
+
+      - name: Extract Result
+        if: always()
+        run: |
+          grep "^RESULT:" /tmp/peer-output.txt | sed 's/^RESULT://' > /tmp/peer-result.json
+          cat /tmp/peer-result.json
+
+      - name: Upload Result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: peer-${{ matrix.peer_index }}-result
+          path: /tmp/peer-result.json
+          retention-days: 7
+
+  aggregate:
+    name: Aggregate Results
+    runs-on: ubuntu-latest
+    needs: peers
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: peer-*-result
+          path: results/
+          merge-multiple: true
+
+      - name: Build Report
+        run: |
+          echo "# 55-Peer Scale Test Report" > report.md
+          echo "" >> report.md
+          echo "**Date:** $(date -u)" >> report.md
+          echo "**Run ID:** ${{ github.run_id }}" >> report.md
+          echo "" >> report.md
+          echo "| # | Peer | Sent | Received | Expected | Delivery % | Senders | Time |" >> report.md
+          echo "|---|------|------|----------|----------|------------|---------|------|" >> report.md
+
+          total_sent=0
+          total_recv=0
+          total_expected=0
+          peers_ok=0
+          peers_fail=0
+
+          for f in results/*.json; do
+            if [ -f "$f" ]; then
+              data=$(cat "$f")
+              peer=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('peer_id','?'))" 2>/dev/null)
+              sent=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sent',0))" 2>/dev/null)
+              recv=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('received',0))" 2>/dev/null)
+              exp=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('expected',0))" 2>/dev/null)
+              pct=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('delivery_pct',0))" 2>/dev/null)
+              senders=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('unique_senders',0))" 2>/dev/null)
+              elapsed=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('elapsed_sec',0))" 2>/dev/null)
+              status=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null)
+
+              total_sent=$((total_sent + sent))
+              total_recv=$((total_recv + recv))
+              total_expected=$((total_expected + exp))
+
+              if [ "$status" = "ok" ]; then
+                peers_ok=$((peers_ok + 1))
+              else
+                peers_fail=$((peers_fail + 1))
+              fi
+
+              echo "| $peer | $sent | $recv | $exp | $pct% | $senders | ${elapsed}s |" >> report.md
+            fi
+          done
+
+          echo "" >> report.md
+          echo "## Summary" >> report.md
+          echo "- **Peers OK:** $peers_ok" >> report.md
+          echo "- **Peers Failed:** $peers_fail" >> report.md
+          echo "- **Total Sent:** $total_sent" >> report.md
+          echo "- **Total Received:** $total_recv" >> report.md
+          echo "- **Total Expected:** $total_expected" >> report.md
+          
+          if [ $total_expected -gt 0 ]; then
+            overall=$(python3 -c "print(round($total_recv / $total_expected * 100, 1))")
+            echo "- **Overall Delivery:** ${overall}%" >> report.md
+          fi
+
+          cat report.md
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-test-report
+          path: report.md
+          retention-days: 14
