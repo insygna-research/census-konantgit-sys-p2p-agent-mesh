@@ -4,8 +4,8 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "p2p-agent-mesh"
-version = "0.5.0"
-description = "P2P Agent Mesh — децентрализованная mesh-сеть для AI-агентов"
+version = "0.7.0"
+description = "P2P Agent Mesh — полный фреймворк для децентрализованной сети AI-агентов (ядро snin + SDK + адаптеры + DePIN)"
 readme = "README.md"
 authors = [
     {name = "SNIN Network", email = "snin@v2.site"},
@@ -18,12 +18,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Topic :: Communications :: File Sharing",
     "Topic :: Internet :: Proxy Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-keywords = ["p2p", "mesh", "agents", "ai", "decentralized", "pubsub"]
+keywords = ["p2p", "mesh", "agents", "ai", "decentralized", "pubsub", "raft", "consensus", "snin"]
 
 requires-python = ">=3.10"
 dependencies = [
     "cryptography>=42.0",
+    "snin>=5.0.0",
 ]
 
 [project.optional-dependencies]
