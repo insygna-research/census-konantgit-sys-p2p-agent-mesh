@@ -5,7 +5,8 @@
 
 
 
-Буферизирует все отправленные и полученные сообщения.
+Буферизирует бизнес-сообщения (agent:* кроме echo).
+Системные сообщения (_dht, _raft, _ping, _heartbeat) → RingBuffer.
 При reconnect: replay с момента последнего коннекта.
 """
 
@@ -14,13 +15,16 @@ import sqlite3
 import threading
 import time
 
+from phase0.ring_buffer import RingBuffer, is_system_topic
+
 
 class WALBuffer:
-    """SQLite-backed WAL для offline-first сообщений."""
+    """SQLite-backed WAL для offline-first сообщений + RingBuffer для системных."""
 
-    def __init__(self, db_path: str = "/tmp/p2p_mesh_wal.db"):
+    def __init__(self, db_path: str = "/tmp/p2p_mesh_wal.db", ring_size: int = 1000):
         self.db_path = db_path
         self._local = threading.local()
+        self._ring = RingBuffer(max_size=ring_size)
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -57,7 +61,27 @@ class WALBuffer:
         conn.close()
 
     def append(self, msg: dict) -> str:
-        """Добавить сообщение в WAL. Возвращает msg_id."""
+        """Добавить сообщение. Системные → RingBuffer, бизнес → SQLite WAL.
+
+        Возвращает msg_id (или "" для системных).
+        """
+        topic = msg.get("topic", "")
+        if is_system_topic(topic):
+            self._ring.append(msg, topic)
+            return msg.get("id", "")
+
+        return self._append_sqlite(msg)
+
+    def append_business(self, msg: dict) -> str:
+        """Явно записать бизнес-сообщение в SQLite WAL (минуя фильтр)."""
+        return self._append_sqlite(msg)
+
+    def append_system(self, msg: dict) -> None:
+        """Явно записать системное сообщение в RingBuffer."""
+        self._ring.append(msg, msg.get("topic", ""))
+
+    def _append_sqlite(self, msg: dict) -> str:
+        """Добавить сообщение в SQLite WAL. Возвращает msg_id."""
         msg_id = msg.get("id", "")
         if not msg_id:
             import hashlib
@@ -132,13 +156,26 @@ class WALBuffer:
         return cursor.rowcount
 
     def count(self, topic: str | None = None) -> int:
-        """Количество сообщений в WAL."""
+        """Количество сообщений в WAL (SQLite, без RingBuffer)."""
         conn = self._get_conn()
         if topic:
             row = conn.execute("SELECT COUNT(*) FROM messages WHERE topic = ?", (topic,)).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
         return row[0] if row else 0
+
+    @property
+    def ring(self) -> RingBuffer:
+        """Системный ring buffer (in-memory)."""
+        return self._ring
+
+    def ring_stats(self) -> dict:
+        """Статистика ring buffer."""
+        return self._ring.stats()
+
+    def total_count(self) -> int:
+        """Всего сообщений: SQLite WAL + RingBuffer."""
+        return self.count() + self._ring.total()
 
     def close(self):
         if hasattr(self._local, "conn") and self._local.conn:
