@@ -1,0 +1,195 @@
+name: 20-Peer Full-Mesh (Multi-Round)
+
+on:
+  workflow_dispatch:
+    inputs:
+      peer_count:
+        description: "Number of peers (max 20 for true full-mesh)"
+        required: true
+        default: "20"
+      msg_count:
+        description: "Messages per peer per round"
+        required: true
+        default: "5"
+      rounds:
+        description: "Number of rounds"
+        required: true
+        default: "3"
+      relay_url:
+        description: "Relay HTTP URL"
+        required: true
+        default: "https://p2p-dash.v2.site"
+
+jobs:
+  peers:
+    name: "Peer ${{ matrix.peer_index }}"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        peer_index: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Full-Mesh Peer (retry x3)
+        id: peer
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 8
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: |
+            RELAY_URL="${{ github.event.inputs.relay_url || 'https://p2p-dash.v2.site' }}" \
+            MSG_COUNT="${{ github.event.inputs.msg_count || '5' }}" \
+            TARGET_PEERS="${{ github.event.inputs.peer_count || '20' }}" \
+            ROUNDS="${{ github.event.inputs.rounds || '3' }}" \
+            TIMEOUT="240" \
+            PEER_ID="ci-peer-${{ github.run_id }}-${{ matrix.peer_index }}" \
+            python3 .github/ci_peer_v2.py 2>&1 | tee /tmp/peer-output.txt
+
+      - name: Upload Metrics Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-peer-${{ matrix.peer_index }}
+          path: metrics_peer_*.json
+          retention-days: 7
+
+      - name: Extract Result
+        if: always()
+        run: |
+          grep "^RESULT:" /tmp/peer-output.txt | sed 's/^RESULT://' > /tmp/result-peer-${{ matrix.peer_index }}.json 2>/dev/null || echo '{"status":"no_result"}' > /tmp/result-peer-${{ matrix.peer_index }}.json
+          cat /tmp/result-peer-${{ matrix.peer_index }}.json
+
+      - name: Upload Result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: peer-${{ matrix.peer_index }}-result
+          path: /tmp/result-peer-${{ matrix.peer_index }}.json
+          retention-days: 7
+
+  aggregate:
+    name: Aggregate Results
+    runs-on: ubuntu-latest
+    needs: peers
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: peer-*-result
+          path: results/
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: metrics-peer-*
+          path: metrics/
+          merge-multiple: true
+
+      - name: Build Report
+        run: |
+          echo "# 20-Peer Full-Mesh Multi-Round Report" > report.md
+          echo "" >> report.md
+          echo "**Date:** $(date -u)" >> report.md
+          echo "**Run ID:** ${{ github.run_id }}" >> report.md
+          echo "" >> report.md
+
+          # Build per-peer table
+          echo "## Per-Peer Results" >> report.md
+          echo "" >> report.md
+          echo "| Peer | Sent | Recv | Expected | Delivery % | Senders | Connect(s) | Lat min | Lat med | Lat max | Lat p95 |" >> report.md
+          echo "|------|------|------|----------|------------|---------|------------|---------|---------|---------|---------|" >> report.md
+
+          total_sent=0
+          total_recv=0
+          total_expected=0
+          peers_ok=0
+          peers_fail=0
+          all_lat_min=999999
+          all_lat_med=0
+          all_lat_max=0
+          all_lat_p95=0
+
+          for f in results/*.json; do
+            if [ -f "$f" ]; then
+              data=$(cat "$f")
+              pid=$(basename "$f" .json | sed 's/result-peer-//')
+              sent=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_sent',0))" 2>/dev/null || echo "0")
+              recv=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_recv',0))" 2>/dev/null || echo "0")
+              exp=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_expected',0))" 2>/dev/null || echo "0")
+              pct=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('overall_delivery_pct',0))" 2>/dev/null || echo "0")
+              senders=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('peer_count',0))" 2>/dev/null || echo "0")
+              ct=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('connect_time_s',0))" 2>/dev/null || echo "0")
+              lat_min=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('latency_ms',{}).get('min','-'))" 2>/dev/null || echo "-")
+              lat_med=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('latency_ms',{}).get('median','-'))" 2>/dev/null || echo "-")
+              lat_max=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('latency_ms',{}).get('max','-'))" 2>/dev/null || echo "-")
+              lat_p95=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('latency_ms',{}).get('p95','-'))" 2>/dev/null || echo "-")
+              status=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "?")
+
+              total_sent=$((total_sent + sent))
+              total_recv=$((total_recv + recv))
+              total_expected=$((total_expected + exp))
+
+              if [ "$status" = "ok" ]; then peers_ok=$((peers_ok + 1)); else peers_fail=$((peers_fail + 1)); fi
+
+              echo "| $pid | $sent | $recv | $exp | $pct% | $senders | ${ct}s | $lat_min | $lat_med | $lat_max | $lat_p95 |" >> report.md
+            fi
+          done
+
+          echo "" >> report.md
+          echo "## Summary" >> report.md
+          echo "- **Peers OK:** $peers_ok" >> report.md
+          echo "- **Peers Failed:** $peers_fail" >> report.md
+          echo "- **Total Sent:** $total_sent" >> report.md
+          echo "- **Total Received:** $total_recv" >> report.md
+          echo "- **Total Expected:** $total_expected" >> report.md
+
+          if [ $total_expected -gt 0 ]; then
+            overall=$(python3 -c "print(round($total_recv / $total_expected * 100, 1))")
+            echo "- **Overall Delivery:** ${overall}%" >> report.md
+          fi
+
+          # Round-by-round breakdown
+          echo "" >> report.md
+          echo "## Round-by-Round Breakdown" >> report.md
+          echo "| Peer | R1 Recv | R1 Del% | R1 Lat med | R2 Recv | R2 Del% | R2 Lat med | R3 Recv | R3 Del% | R3 Lat med |" >> report.md
+          echo "|------|---------|---------|------------|---------|---------|------------|---------|---------|------------|" >> report.md
+
+          for f in results/*.json; do
+            if [ -f "$f" ]; then
+              data=$(cat "$f")
+              pid=$(basename "$f" .json | sed 's/result-peer-//')
+              python3 -c "
+import json, sys
+d = json.load(open('$f'))
+rounds = d.get('rounds', [])
+r1 = rounds[0] if len(rounds)>0 else {}
+r2 = rounds[1] if len(rounds)>1 else {}
+r3 = rounds[2] if len(rounds)>2 else {}
+r1l = r1.get('latency_ms',{}) or {}
+r2l = r2.get('latency_ms',{}) or {}
+r3l = r3.get('latency_ms',{}) or {}
+print(f'| $pid | {r1.get(\"received\",\"-\")} | {r1.get(\"delivery_pct\",\"-\")}% | {r1l.get(\"median\",\"-\")} | {r2.get(\"received\",\"-\")} | {r2.get(\"delivery_pct\",\"-\")}% | {r2l.get(\"median\",\"-\")} | {r3.get(\"received\",\"-\")} | {r3.get(\"delivery_pct\",\"-\")}% | {r3l.get(\"median\",\"-\")} |')
+" 2>/dev/null
+            fi
+          done
+
+          echo "" >> report.md
+          echo "## Metrics Files" >> report.md
+          echo "\`\`\`" >> report.md
+          ls -la metrics/ >> report.md 2>/dev/null || echo "No metrics artifacts" >> report.md
+          echo "\`\`\`" >> report.md
+
+          cat report.md
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-mesh-report
+          path: report.md
+          retention-days: 14
