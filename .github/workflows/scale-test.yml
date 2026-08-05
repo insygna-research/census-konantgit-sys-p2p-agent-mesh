@@ -12,9 +12,9 @@ on:
         required: true
         default: "10"
       relay_url:
-        description: "Relay WebSocket URL"
+        description: "Relay HTTP URL"
         required: true
-        default: "wss://p2p-dash.v2.site/relay"
+        default: "https://p2p-dash.v2.site"
 
 jobs:
   peers:
@@ -39,8 +39,8 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: |
-            pip install websockets -q
-            RELAY_URL="${{ github.event.inputs.relay_url || 'wss://p2p-dash.v2.site/relay' }}" \
+            # HTTP-only ci_peer — no external deps (stdlib urllib)
+            RELAY_URL="${{ github.event.inputs.relay_url || 'https://p2p-dash.v2.site' }}" \
             MSG_COUNT="${{ github.event.inputs.msg_count || '10' }}" \
             TIMEOUT="120" \
             PEER_ID="ci-peer-${{ github.run_id }}-${{ matrix.peer_index }}" \
