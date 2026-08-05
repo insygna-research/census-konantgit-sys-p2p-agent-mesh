@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CI Peer for 55-Peer Scale Test.
-Pure stdlib (asyncio + json) — no pip install needed.
-Connects to mesh relay, publishes messages, counts received, sends results.
+CI Peer for 55-Peer Scale Test — WebSocket version.
+Uses `websockets` library (pip install websockets).
+Connects to relay, publishes, counts received, sends results.
 """
 import asyncio
 import json
@@ -10,11 +10,12 @@ import os
 import sys
 import time
 
-RELAY_HOST = os.environ.get("MESH_RELAY_HOST", "mesh-test.v2.site")
-RELAY_PORT = int(os.environ.get("MESH_RELAY_PORT", "9766"))
+import websockets
+
+RELAY_URL = os.environ.get("RELAY_URL", "wss://p2p-dash.v2.site/relay")
 PEER_ID = os.environ.get("PEER_ID", f"ci-peer-{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_JOB', '0')}")
 MSG_COUNT = int(os.environ.get("MSG_COUNT", "10"))
-TIMEOUT = int(os.environ.get("TIMEOUT", "60"))
+TIMEOUT = int(os.environ.get("TIMEOUT", "120"))
 
 received: list[dict] = []
 sent_count = 0
@@ -22,60 +23,52 @@ sent_count = 0
 
 async def run():
     global sent_count
-    print(f"[{PEER_ID}] Connecting to {RELAY_HOST}:{RELAY_PORT}...", flush=True)
+    print(f"[{PEER_ID}] Connecting to {RELAY_URL}...", flush=True)
 
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(RELAY_HOST, RELAY_PORT), timeout=15
+        ws = await asyncio.wait_for(
+            websockets.connect(RELAY_URL, max_size=2**20), timeout=20
         )
     except Exception as e:
         print(f"[{PEER_ID}] CONNECT FAILED: {e}", flush=True)
-        result = {"status": "connect_failed", "error": str(e)}
-        print(f"RESULT:{json.dumps(result)}", flush=True)
+        print(f"RESULT:{json.dumps({'status': 'connect_failed', 'error': str(e)})}", flush=True)
         sys.exit(1)
 
     # Hello
     hello = {"type": "hello", "peer_id": PEER_ID, "topics": ["_all"]}
-    writer.write((json.dumps(hello) + "\n").encode())
-    await writer.drain()
+    await ws.send(json.dumps(hello))
 
     # Welcome
     try:
-        welcome_line = await asyncio.wait_for(reader.readline(), timeout=10)
-        welcome = json.loads(welcome_line.decode().strip())
+        welcome_raw = await asyncio.wait_for(ws.recv(), timeout=15)
+        welcome = json.loads(welcome_raw)
         print(f"[{PEER_ID}] Connected! {welcome['peer_count']} peers online", flush=True)
     except Exception as e:
         print(f"[{PEER_ID}] HANDSHAKE FAILED: {e}", flush=True)
-        result = {"status": "handshake_failed", "error": str(e)}
-        print(f"RESULT:{json.dumps(result)}", flush=True)
+        print(f"RESULT:{json.dumps({'status': 'handshake_failed', 'error': str(e)})}", flush=True)
         sys.exit(1)
 
     # Background reader
     async def reader_task():
-        while True:
-            try:
-                line = await asyncio.wait_for(reader.readline(), timeout=5)
-                if not line:
-                    break
-                msg = json.loads(line.decode().strip())
+        try:
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=120)
+                msg = json.loads(raw)
                 if msg.get("type") == "message":
                     received.append(msg)
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                break
+        except Exception:
+            pass
 
     reader_ft = asyncio.create_task(reader_task())
 
-    # Wait for all peers to join (5 more seconds)
+    # Wait for peers to join
     await asyncio.sleep(5)
 
-    # Request stats to see peer count
-    writer.write((json.dumps({"type": "stats_request"}) + "\n").encode())
-    await writer.drain()
+    # Request current stats
+    await ws.send(json.dumps({"type": "stats_request"}))
     try:
-        stats_line = await asyncio.wait_for(reader.readline(), timeout=3)
-        stats = json.loads(stats_line.decode().strip())
+        stats_raw = await asyncio.wait_for(ws.recv(), timeout=5)
+        stats = json.loads(stats_raw)
         peer_count = stats.get("peer_count", 0)
         print(f"[{PEER_ID}] Stats: {peer_count} peers", flush=True)
     except Exception:
@@ -88,16 +81,15 @@ async def run():
             "type": "publish",
             "topic": "_all",
             "msg_id": f"{PEER_ID}-{i}",
-            "data": f"Scale test message #{i} from {PEER_ID}",
+            "data": f"Scale test msg #{i} from {PEER_ID}",
         }
-        writer.write((json.dumps(msg) + "\n").encode())
+        await ws.send(json.dumps(msg))
         sent_count += 1
-        await asyncio.sleep(0.1)  # 10 msg/sec — не спамим
-    await writer.drain()
+        await asyncio.sleep(0.1)
     t_sent = time.time()
     print(f"[{PEER_ID}] Sent {MSG_COUNT} messages in {t_sent - t_start:.1f}s", flush=True)
 
-    # Wait to receive messages from other peers
+    # Wait for incoming messages
     remaining = TIMEOUT - (t_sent - t_start) - 10
     if remaining > 0:
         await asyncio.sleep(remaining)
@@ -109,16 +101,14 @@ async def run():
     except asyncio.CancelledError:
         pass
 
-    # Request final stats
-    writer.write((json.dumps({"type": "stats_request"}) + "\n").encode())
-    await writer.drain()
+    # Final stats
+    await ws.send(json.dumps({"type": "stats_request"}))
     try:
-        stats_line = await asyncio.wait_for(reader.readline(), timeout=3)
-        final_stats = json.loads(stats_line.decode().strip())
+        stats_raw = await asyncio.wait_for(ws.recv(), timeout=5)
+        final_stats = json.loads(stats_raw)
     except Exception:
         final_stats = {"error": "stats_timeout"}
 
-    # Compute results
     my_received = len(received)
     expected = (peer_count - 1) * MSG_COUNT if peer_count > 1 else 0
     delivery_pct = (my_received / expected * 100) if expected > 0 else 100.0
@@ -138,7 +128,7 @@ async def run():
     }
     print(f"RESULT:{json.dumps(result)}", flush=True)
 
-    writer.close()
+    await ws.close()
 
 
 if __name__ == "__main__":

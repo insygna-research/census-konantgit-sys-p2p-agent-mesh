@@ -11,14 +11,10 @@ on:
         description: "Messages per peer"
         required: true
         default: "10"
-      relay_host:
-        description: "Relay hostname"
+      relay_url:
+        description: "Relay WebSocket URL"
         required: true
-        default: "mesh-test.v2.site"
-      relay_port:
-        description: "Relay port"
-        required: true
-        default: "9766"
+        default: "wss://p2p-dash.v2.site/relay"
 
 jobs:
   peers:
@@ -38,12 +34,13 @@ jobs:
         id: peer
         timeout-minutes: 3
         env:
-          MESH_RELAY_HOST: ${{ github.event.inputs.relay_host || 'mesh-test.v2.site' }}
-          MESH_RELAY_PORT: ${{ github.event.inputs.relay_port || '9766' }}
+          RELAY_URL: ${{ github.event.inputs.relay_url || 'wss://p2p-dash.v2.site/relay' }}
           MSG_COUNT: ${{ github.event.inputs.msg_count || '10' }}
           TIMEOUT: "120"
           PEER_ID: "ci-peer-${{ github.run_id }}-${{ matrix.peer_index }}"
-        run: python3 .github/ci_peer.py 2>&1 | tee /tmp/peer-output.txt
+        run: |
+          pip install websockets -q
+          python3 .github/ci_peer.py 2>&1 | tee /tmp/peer-output.txt
 
       - name: Extract Result
         if: always()
