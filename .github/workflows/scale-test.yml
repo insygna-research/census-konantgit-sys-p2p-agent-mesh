@@ -21,7 +21,7 @@ jobs:
     name: "Peer ${{ matrix.peer_index }}"
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 5
+    timeout-minutes: 8
     strategy:
       fail-fast: false
       max-parallel: 20  # GitHub free tier limit — не больше 20 одновременно
@@ -35,14 +35,15 @@ jobs:
         id: peer
         uses: nick-invision/retry@v2
         with:
-          timeout_minutes: 3
+          timeout_minutes: 6
           max_attempts: 3
           retry_wait_seconds: 15
           command: |
-            # HTTP-only ci_peer — no external deps (stdlib urllib)
+            # HTTP-only ci_peer — v0.9.0 multi-round polling
             RELAY_URL="${{ github.event.inputs.relay_url || 'https://p2p-dash.v2.site' }}" \
             MSG_COUNT="${{ github.event.inputs.msg_count || '10' }}" \
-            TIMEOUT="120" \
+            TARGET_PEERS="${{ github.event.inputs.peer_count || '55' }}" \
+            TIMEOUT="180" \
             PEER_ID="ci-peer-${{ github.run_id }}-${{ matrix.peer_index }}" \
             python3 .github/ci_peer.py 2>&1 | tee /tmp/peer-output.txt
 
@@ -57,15 +58,15 @@ jobs:
       - name: Extract Result
         if: always()
         run: |
-          grep "^RESULT:" /tmp/peer-output.txt | sed 's/^RESULT://' > /tmp/peer-result.json 2>/dev/null || echo '{"status":"no_result"}' > /tmp/peer-result.json
-          cat /tmp/peer-result.json
+          grep "^RESULT:" /tmp/peer-output.txt | sed 's/^RESULT://' > /tmp/result-peer-${{ matrix.peer_index }}.json 2>/dev/null || echo '{"status":"no_result"}' > /tmp/result-peer-${{ matrix.peer_index }}.json
+          cat /tmp/result-peer-${{ matrix.peer_index }}.json
 
       - name: Upload Result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: peer-${{ matrix.peer_index }}-result
-          path: /tmp/peer-result.json
+          path: /tmp/result-peer-${{ matrix.peer_index }}.json
           retention-days: 7
 
   aggregate:
@@ -93,8 +94,8 @@ jobs:
           echo "**Date:** $(date -u)" >> report.md
           echo "**Run ID:** ${{ github.run_id }}" >> report.md
           echo "" >> report.md
-          echo "| Peer | Sent | Received | Expected | Delivery % | Senders | Connect(s) | Errors |" >> report.md
-          echo "|------|------|----------|----------|------------|---------|------------|--------|" >> report.md
+          echo "| Peer | Sent | Received | Expected | Delivery % | Senders | Connect(s) | Poll Rounds | Errors |" >> report.md
+          echo "|------|------|----------|----------|------------|---------|------------|-------------|--------|" >> report.md
 
           total_sent=0
           total_recv=0
@@ -105,15 +106,16 @@ jobs:
           for f in results/*.json; do
             if [ -f "$f" ]; then
               data=$(cat "$f")
-              peer_idx=$(echo "$f" | sed 's/.*peer-//' | sed 's/-result.*//')
               sent=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sent',0))" 2>/dev/null || echo "0")
               recv=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('received',0))" 2>/dev/null || echo "0")
               exp=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('expected',0))" 2>/dev/null || echo "0")
               pct=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('delivery_pct',0))" 2>/dev/null || echo "0")
               senders=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('unique_senders',0))" 2>/dev/null || echo "0")
               ct=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('connect_time_s',0))" 2>/dev/null || echo "0")
+              rounds=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('poll_rounds',0))" 2>/dev/null || echo "0")
               errs=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('errors',0))" 2>/dev/null || echo "0")
               status=$(echo "$data" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "?")
+              pid=$(basename "$f" .json | sed 's/result-peer-//')
 
               total_sent=$((total_sent + sent))
               total_recv=$((total_recv + recv))
@@ -125,7 +127,7 @@ jobs:
                 peers_fail=$((peers_fail + 1))
               fi
 
-              echo "| $peer_idx | $sent | $recv | $exp | $pct% | $senders | ${ct}s | $errs |" >> report.md
+              echo "| $pid | $sent | $recv | $exp | $pct% | $senders | ${ct}s | $rounds | $errs |" >> report.md
             fi
           done
 
@@ -144,7 +146,9 @@ jobs:
 
           echo "" >> report.md
           echo "## Metrics Files" >> report.md
+          echo "\`\`\`" >> report.md
           ls -la metrics/ >> report.md 2>/dev/null || echo "No metrics artifacts" >> report.md
+          echo "\`\`\`" >> report.md
 
           cat report.md
 
