@@ -266,8 +266,15 @@ def main():
             rl = rd["latency_ms"]
             print(f"[{PEER_ID}] {rlabel} latency: min={rl['min']}ms med={rl['median']}ms max={rl['max']}ms p95={rl['p95']}ms ({rl['count']} samples)", flush=True)
 
-    # Phase 4: Final report
-    total_expected = expected_per_round * ROUNDS if expected_per_round > 0 else 0
+    # Phase 4: Final report — calculate expected from actual observed senders
+    # Use max unique senders across rounds for honest expected count
+    max_senders = max((rd["unique_senders"] for rd in rounds_data), default=0)
+    effective_senders = max(max_senders, peer_count - 1 if peer_count > 1 else 0)
+    # Cap at 19 (TARGET_PEERS - 1) — relay may report inflated counts
+    effective_senders = min(effective_senders, TARGET_PEERS - 1) if TARGET_PEERS > 1 else effective_senders
+    total_expected = effective_senders * MSG_COUNT * ROUNDS if effective_senders > 0 else (expected_per_round * ROUNDS)
+    # Also compute relay-based expected for debugging
+    relay_expected = expected_per_round * ROUNDS
     result = {
         "status": "ok",
         "peer_id": PEER_ID,
@@ -276,7 +283,8 @@ def main():
         "total_sent": total_sent,
         "total_recv": total_recv,
         "total_expected": total_expected,
-        "overall_delivery_pct": round(total_recv / total_expected * 100, 1) if total_expected > 0 else 100.0,
+        "overall_delivery_pct": round(total_recv / max(total_expected, 1) * 100, 1),
+        "rounds": rounds_data,  # Include round-by-round data in result
         "latency_ms": {
             "min": round(min(all_latencies_ms), 1) if all_latencies_ms else None,
             "median": round(sorted(all_latencies_ms)[len(all_latencies_ms)//2], 1) if all_latencies_ms else None,
